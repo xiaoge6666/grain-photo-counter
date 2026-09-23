@@ -1,0 +1,19 @@
+# 构建产物
+build/
+.gradle/
+*.apk
+
+# 本地配置（含本机 SDK 路径）
+local.properties
+
+# IDE
+.idea/
+*.iml
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 系统
+.DS_Store
+Thumbs.db

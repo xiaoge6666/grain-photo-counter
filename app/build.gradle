@@ -1,0 +1,47 @@
+plugins {
+    id 'com.android.application'
+    id 'com.chaquo.python'
+}
+
+android {
+    namespace 'com.example.ricecounter'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.example.ricecounter"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core:1.9.0'
+}
+
+chaquopy {
+    defaultConfig {
+        version = "3.10"
+        buildPython("C:/Users/Administrator/.openclaw/workspace/_android_env/Python310/python.exe")
+        pip {
+            install("numpy")
+            install("opencv-python-headless")
+        }
+    }
+}
