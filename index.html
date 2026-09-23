@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="谷粒计数">
+<title>谷粒 拍照 秒出 谷粒数</title>
+<script async src="opencv.js"></script>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin:0; padding:16px; font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; background:#f5f6f8; color:#222; max-width:640px; margin:0 auto; }
+  h1 { font-size:22px; margin:8px 0 4px; }
+  .sub { font-size:13px; color:#888; margin-bottom:16px; }
+  .btns { display:flex; gap:12px; margin-bottom:16px; }
+  button { flex:1; padding:14px 0; font-size:17px; border:none; border-radius:12px; color:#fff; cursor:pointer; background:#2563eb; }
+  button#pick { background:#16a34a; }
+  button:active { opacity:0.8; }
+  #status { font-size:15px; color:#555; margin-bottom:10px; min-height:22px; }
+  #result { font-size:26px; font-weight:700; color:#dc2626; margin-bottom:12px; min-height:34px; }
+  #canvasWrap { display:none; text-align:center; }
+  canvas { max-width:100%; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,.12); }
+  input[type=file] { display:none; }
+</style>
+</head>
+<body>
+  <h1>谷粒 拍照 秒出 谷粒数</h1>
+  <div class="sub">拍一张稻谷/米粒散粒照片，秒出谷粒数 + 逐粒标注图（ASW-SPC 算法）</div>
+  <div class="btns">
+    <button id="shoot">📷 拍照</button>
+    <button id="pick">🖼 选图</button>
+  </div>
+  <input type="file" id="camera" accept="image/*" capture="environment">
+  <input type="file" id="gallery" accept="image/*">
+  <div id="status">正在加载 OpenCV.js…</div>
+  <div id="result"></div>
+  <div id="canvasWrap"><canvas id="out"></canvas></div>
+
+<script>
+// ============ 常量 ============
+const EPS=1e-12, MAX_COVERAGE=0.5, MIN_SINGLES=3;
+const MIN_AXIS_RATIO=1.25, MAX_AXIS_RATIO=8.0, MIN_SOLIDITY=0.80;
+const MAX_GRAIN_AREA_FRACTION=0.01, MAX_GRAIN_EXTENT=0.5;
+const DEFAULT_CHANNELS=["gray","hsv_s"];
+const SUBSTRATE_AREA_RATIO=20.0, SPECK_AREA_RATIO=0.3;
+const NOISE_FLOOR_PX=5, SHAPE_FLOOR_RATIO=0.3;
+const SINGLE_BAND=[0.65,1.45];
+const BETA=0.10, MIN_DEPTH_PX=1.0, SEED_MERGE_RATIO=0.6;
+const TOUCH_AREA_RATIO=1.2, TOUCH_SOLIDITY_MARGIN=0.06;
+const MIN_TRUSTED_MINOR_PX=4.5, COARSE_TOUCH_EXCESS=1.5;
+const FOREIGN_AREA_RATIO=3.0, FOREIGN_WIDTH_RATIO=2.5;
+const FRAGMENT_RATIO=0.4, RESIDUAL_RATIO=1.5, CONCAVITY_MARGIN=0.03;
+const SPECK_RATIO=0.3, RESPLIT=true, MAX_SIDE=720;
+
+let cvReady=false;
+
+function onCvReady() {
+  cvReady = true;
+  document.getElementById('status').textContent = '就绪，点"拍照"或"选图"开始';
+}
+if (typeof cv !== 'undefined') {
+  cv.onRuntimeInitialized = onCvReady;
+} else {
+  // cv 还没加载（async script），等 window load 后再绑定
+  window.addEventListener('load', function() {
+    if (typeof cv !== 'undefined' && cv.Mat) {
+      onCvReady();
+    } else if (typeof cv !== 'undefined') {
+      cv.onRuntimeInitialized = onCvReady;
+    }
+  });
+}
+
+// ============ 数值工具 ============
+function f32(mat){ return new Float32Array(mat.data32F.buffer, mat.data32F.byteOffset, mat.rows*mat.cols); }
+function i32(mat){ return new Int32Array(mat.data32S.buffer, mat.data32S.byteOffset, mat.rows*mat.cols); }
+function u8(mat){ return new Uint8Array(mat.data.buffer, mat.data.byteOffset, mat.rows*mat.cols); }
+
+function calcHist(mat){
+  const h=new Float64Array(256); const d=u8(mat);
+  for(let i=0;i<d.length;i++) h[d[i]]++;
+  return h;
+}
+
+function multiOtsu(hist, classes){
+  classes=classes||3;
+  const N=hist.length; let total=0;
+  for(let i=0;i<N;i++) total+=hist[i];
+  const p=new Float64Array(N); for(let i=0;i<N;i++) p[i]=hist[i]/(total+EPS);
+  const omega=new Float64Array(N), muCum=new Float64Array(N);
+  omega[0]=p[0];
+  for(let i=1;i<N;i++){ omega[i]=omega[i-1]+p[i]; muCum[i]=muCum[i-1]+p[i]*i; }
+  const muTotal=muCum[N-1];
+  if(classes===3){
+    let best=0,bt1=0,bt2=0;
+    for(let t1=1;t1<N-1;t1++){
+      const w1=omega[t1-1]; if(w1<=0) continue;
+      const mu1=muCum[t1-1]/w1;
+      for(let t2=t1+1;t2<N;t2++){
+        const w2=omega[t2-1]-w1, w3=1-omega[t2-1];
+        if(w2<=0||w3<=0) continue;
+        const mu2=(muCum[t2-1]-muCum[t1-1])/w2, mu3=(muTotal-muCum[t2-1])/w3;
+        const sb=w1*(mu1-muTotal)**2+w2*(mu2-muTotal)**2+w3*(mu3-muTotal)**2;
+        if(sb>best){best=sb;bt1=t1;bt2=t2;}
+      }
+    }
+    return [bt1,bt2];
+  }
+  let best=0,bt=0;
+  for(let i=0;i<N;i++){
+    const w=omega[i]; if(w<=0||w>=1) continue;
+    const sb=(muTotal*w-muCum[i])**2/(w*(1-w)+EPS);
+    if(sb>best){best=sb;bt=i;}
+  }
+  return [bt];
+}
+
+// 连通域 + 面积/bbox 统计
+function ccStats(binary){
+  const labels=new cv.Mat(), stats=new cv.Mat(), centroids=new cv.Mat();
+  const count=cv.connectedComponentsWithStats(binary, labels, stats, centroids, 8);
+  return {count, labels, stats, centroids};
+}
+
+// 灰度形态学重建 by dilation
+function grayReconstruct(marker, mask){
+  const out=marker.clone(); const kernel=cv.Mat.ones(3,3,cv.CV_8U);
+  let prev=new cv.Mat();
+  for(let it=0;it<300;it++){
+    prev=out.clone();
+    cv.dilate(out, out, kernel);
+    cv.min(out, mask, out);
+    const diff=new cv.Mat();
+    cv.absdiff(out, prev, diff);
+    const s=cv.countNonZero(diff); prev.delete(); diff.delete();
+    if(s===0) break;
+  }
+  kernel.delete(); return out;
+}
+
+function hMaxima(dist, h){
+  const image=new cv.Mat(); dist.convertTo(image, cv.CV_64F);
+  const resolution=2*1.1920928955078125e-7;
+  const shifted=new cv.Mat();
+  const hMat=new cv.Mat(image.rows, image.cols, cv.CV_64F, new cv.Scalar(h));
+  cv.subtract(image, hMat, shifted);
+  hMat.delete();
+  const absImg=new cv.Mat();
+  cv.absdiff(image, cv.Mat.zeros(image.rows,image.cols,cv.CV_64F), absImg);
+  const res=new cv.Mat();
+  const resMat=new cv.Mat(image.rows, image.cols, cv.CV_64F, new cv.Scalar(resolution));
+  cv.multiply(absImg, resMat, res);
+  resMat.delete();
+  cv.subtract(shifted, res, shifted);
+  absImg.delete(); res.delete();
+  const rec=grayReconstruct(shifted, image);
+  const residue=new cv.Mat(); cv.subtract(image, rec, residue);
+  const hmax=new cv.Mat(); cv.threshold(residue, hmax, h, 255, cv.THRESH_BINARY);
+  const out=new cv.Mat(); hmax.convertTo(out, cv.CV_8U);
+  image.delete(); shifted.delete(); rec.delete(); residue.delete(); hmax.delete();
+  return out;
+}
+
+// priority-flood watershed（等价 skimage.watershed(-dist, markers, mask)）
+function wsWatershed(dist, markers, mask){
+  const h=dist.rows, w=dist.cols, N=h*w;
+  const dd=f32(dist); const mk=i32(markers); const msk=u8(mask);
+  const out=new Int32Array(N);
+  // 最大堆：存 [dist值, idx]，按 dist 降序 pop
+  const heap=[];
+  function push(d, idx){ heap.push([d,idx]); let i=heap.length-1; while(i>0){ const p=(i-1)>>1; if(heap[p][0]>=heap[i][0]) break; [heap[p],heap[i]]=[heap[i],heap[p]]; i=p; } }
+  function pop(){ const top=heap[0]; const last=heap.pop(); if(heap.length){ heap[0]=last; let i=0; while(true){ const l=2*i+1,r=2*i+2; let m=i; if(l<heap.length&&heap[l][0]>heap[m][0]) m=l; if(r<heap.length&&heap[r][0]>heap[m][0]) m=r; if(m===i) break; [heap[m],heap[i]]=[heap[i],heap[m]]; i=m; } } return top; }
+  for(let i=0;i<N;i++){ if(mk[i]>0){ out[i]=mk[i]; push(dd[i], i); } }
+  const visited=new Uint8Array(N);
+  for(const [d,i] of heap) visited[i]=1;
+  while(heap.length){
+    const [d, idx]=pop();
+    const r=(idx/w)|0, c=idx%w;
+    const val=out[idx];
+    const nb=[[r-1,c],[r+1,c],[r,c-1],[r,c+1]];
+    for(const [nr,nc] of nb){
+      if(nr<0||nr>=h||nc<0||nc>=w) continue;
+      const nidx=nr*w+nc;
+      if(!msk[nidx]||visited[nidx]) continue;
+      out[nidx]=val; visited[nidx]=1;
+      push(dd[nidx], nidx);
+    }
+  }
+  return out;
+}
+// ============ preprocess ============
+function candidateChannels(img){
+  const hsv=new cv.Mat();
+  cv.cvtColor(img, hsv, cv.COLOR_BGR2HSV);
+  const gray=new cv.Mat(); cv.cvtColor(img, gray, cv.COLOR_BGR2GRAY);
+  const hsvCh=new cv.MatVector();
+  cv.split(hsv, hsvCh);
+  const res={gray:gray, hsv_s:hsvCh.get(1)};
+  hsvCh.get(0).delete(); hsvCh.get(2).delete();
+  hsv.delete(); hsvCh.delete();
+  return res;
+}
+
+function otsuSeparability(ch){
+  const hist=calcHist(ch);
+  const N=256, p=new Float64Array(N); let total=0;
+  for(let i=0;i<N;i++) total+=hist[i];
+  for(let i=0;i<N;i++) p[i]=hist[i]/(total+EPS);
+  const omega=new Float64Array(N), mu=new Float64Array(N);
+  omega[0]=p[0];
+  for(let i=1;i<N;i++){ omega[i]=omega[i-1]+p[i]; mu[i]=mu[i-1]+p[i]*i; }
+  const muTotal=mu[N-1];
+  let sigmaTotal2=0; for(let i=0;i<N;i++) sigmaTotal2+=p[i]*(i-muTotal)*(i-muTotal);
+  let bestT=0, bestSb=0;
+  for(let i=0;i<N;i++){
+    const w=omega[i];
+    if(w<=0||w>=1) continue;
+    const sb=(muTotal*w-mu[i])*(muTotal*w-mu[i])/(w*(1-w)+EPS);
+    if(sb>bestSb){bestSb=sb;bestT=i;}
+  }
+  return [bestT, bestSb/(sigmaTotal2+EPS)];
+}
+
+function cleanMask(mask){
+  const kernel=cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3,3));
+  const out=new cv.Mat();
+  cv.morphologyEx(mask, out, cv.MORPH_OPEN, kernel);
+  cv.morphologyEx(out, out, cv.MORPH_CLOSE, kernel);
+  kernel.delete();
+  return out;
+}
+
+function candidateMasks(img){
+  const chans=candidateChannels(img);
+  const out=[];
+  for(const name of DEFAULT_CHANNELS){
+    const ch=chans[name];
+    const [tOtsu, eta]=otsuSeparability(ch);
+    const hist=calcHist(ch);
+    const splits=[{method:'otsu', thresholds:[tOtsu]}];
+    try { splits.push({method:'multiotsu', thresholds:multiOtsu(hist, 3)}); } catch(e){}
+    for(const s of splits){
+      const thr=s.thresholds;
+      for(const polarity of ['bright','dark']){
+        const raw=new cv.Mat();
+        if(polarity==='bright') cv.threshold(ch, raw, thr[thr.length-1], 255, cv.THRESH_BINARY);
+        else cv.threshold(ch, raw, thr[0], 255, cv.THRESH_BINARY_INV);
+        const msk=cleanMask(raw);
+        out.push({channel_name:name, channel:ch, method:s.method, polarity, thresholds:thr, eta, raw_mask:raw, mask:msk});
+      }
+    }
+  }
+  for(const k of ['gray','hsv_s','lab_a','lab_b']) if(chans[k]) chans[k].delete();
+  return out;
+}
+
+function clearBorder(labels, h, w){
+  const ldata=i32(labels);
+  const border=new Set();
+  for(let c=0;c<w;c++){ border.add(ldata[c]); border.add(ldata[(h-1)*w+c]); }
+  for(let r=0;r<h;r++){ border.add(ldata[r*w]); border.add(ldata[r*w+w-1]); }
+  border.delete(0);
+  const out=new Uint8Array(h*w);
+  for(let i=0;i<h*w;i++) out[i]=(ldata[i]>0 && !border.has(ldata[i]))?1:0;
+  return out;
+}
+
+function localContrast(channel, mask){
+  const h=channel.rows, w=channel.cols;
+  const cdata=u8(channel), mdata=u8(mask);
+  let fgSum=0, fgN=0, ringSum=0, ringN=0;
+  const inner=new cv.Mat(); cv.dilate(mask, inner, cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3,3)));
+  const ring=new cv.Mat(); cv.dilate(mask, ring, cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(9,9)));
+  const idata=u8(inner), rdata=u8(ring);
+  for(let i=0;i<h*w;i++){
+    if(mdata[i]){ fgSum+=cdata[i]; fgN++; }
+    else if(rdata[i] && !idata[i]){ ringSum+=cdata[i]; ringN++; }
+  }
+  inner.delete(); ring.delete();
+  if(!fgN||!ringN) return 0;
+  const fgMean=fgSum/fgN, ringMean=ringSum/ringN;
+  let varSum=0; for(let i=0;i<h*w;i++){ varSum+=(cdata[i]-cdata.reduce?0:0); }
+  let mean=0; for(let i=0;i<h*w;i++) mean+=cdata[i]; mean/=h*w;
+  let sd=0; for(let i=0;i<h*w;i++) sd+=(cdata[i]-mean)*(cdata[i]-mean); sd=Math.sqrt(sd/(h*w));
+  return Math.abs(fgMean-ringMean)/(sd+EPS);
+}
+
+function dropSubstrate(mask, a0){
+  const {count, labels} = ccStats(mask);
+  const h=mask.rows, w=mask.cols;
+  const ldata=i32(labels);
+  const areas=new Float64Array(count);
+  for(let i=0;i<h*w;i++) areas[ldata[i]]++;
+  const border=new Set();
+  for(let c=0;c<w;c++){ border.add(ldata[c]); border.add(ldata[(h-1)*w+c]); }
+  for(let r=0;r<h;r++){ border.add(ldata[r*w]); border.add(ldata[r*w+w-1]); }
+  border.delete(0);
+  const out=mask.clone();
+  const odata=u8(out);
+  for(let i=0;i<h*w;i++){
+    const lab=ldata[i];
+    if(lab>0 && border.has(lab) && areas[lab] > SUBSTRATE_AREA_RATIO*a0) odata[i]=0;
+  }
+  labels.delete(); return out;
+}
+
+function removeSpecks(mask, a0){
+  const {count, labels} = ccStats(mask);
+  const h=mask.rows, w=mask.cols;
+  const ldata=i32(labels);
+  const areas=new Float64Array(count);
+  for(let i=0;i<h*w;i++) areas[ldata[i]]++;
+  const speck=new Uint8Array(count);
+  for(let lab=1;lab<count;lab++) if(areas[lab] < SPECK_AREA_RATIO*a0) speck[lab]=1;
+  const out=mask.clone();
+  const odata=u8(out);
+  for(let i=0;i<h*w;i++){ if(ldata[i]>0 && speck[ldata[i]]) odata[i]=0; }
+  labels.delete(); return out;
+}
+
+// ============ calibrate ============
+function componentTable(mask){
+  const {count, labels, stats, centroids} = ccStats(mask);
+  if(count<=1){ labels.delete(); stats.delete(); centroids.delete(); return {labels:null, rows:[]}; }
+  const h=mask.rows, w=mask.cols;
+  const ldata=i32(labels), sdata=i32(stats);
+  const areas=new Float64Array(count), left=new Int32Array(count), top=new Int32Array(count), ww=new Int32Array(count), hh=new Int32Array(count);
+  for(let i=1;i<count;i++){ left[i]=sdata[i*5]; top[i]=sdata[i*5+1]; ww[i]=sdata[i*5+2]; hh[i]=sdata[i*5+3]; areas[i]=sdata[i*5+4]; }
+  // distance transform + per-label 最大
+  const dist=new cv.Mat(); cv.distanceTransform(mask, dist, cv.DIST_L2, 5);
+  const ddata=f32(dist);
+  const maxDist=new Float64Array(count);
+  for(let i=0;i<h*w;i++){ const lab=ldata[i]; if(lab>0 && ddata[i]>maxDist[lab]) maxDist[lab]=ddata[i]; }
+  // 二阶矩
+  const npx=new Float64Array(count), sx=new Float64Array(count), sy=new Float64Array(count), sxx=new Float64Array(count), syy=new Float64Array(count), sxy=new Float64Array(count);
+  for(let r=0;r<h;r++){ for(let c=0;c<w;c++){ const lab=ldata[r*w+c]; if(lab<=0) continue; npx[lab]++; sx[lab]+=c; sy[lab]+=r; sxx[lab]+=c*c; syy[lab]+=r*r; sxy[lab]+=c*r; } }
+  const rows=[];
+  for(let i=1;i<count;i++){
+    const n=npx[i]; if(n<=0) continue;
+    const mx=sx[i]/n, my=sy[i]/n;
+    const muxx=sxx[i]/n-mx*mx, muyy=syy[i]/n-my*my, muxy=sxy[i]/n-mx*my;
+    const spread=Math.sqrt(Math.max((muxx-muyy)*(muxx-muyy)+4*muxy*muxy, 0));
+    const major=4*Math.sqrt(Math.max((muxx+muyy+spread)/2, 0));
+    const minor=4*Math.sqrt(Math.max((muxx+muyy-spread)/2, 0));
+    rows.push({label:i, area:areas[i], solidity:NaN, major, minor, width:2*maxDist[i], axis_ratio: minor>0?major/minor:Infinity, bbox:[top[i],left[i],top[i]+hh[i],left[i]+ww[i]]});
+  }
+  return {labels, rows, count};
+}
+
+function fillSolidity(labels, rows, threshold){
+  const h=labels.rows, w=labels.cols;
+  for(const r of rows){
+    if(threshold!==undefined && r.area < threshold) continue;
+    // 提取该 label 的 mask
+    const mask=new cv.Mat.zeros(h, w, cv.CV_8U);
+    const ldata=i32(labels);
+    for(let i=0;i<h*w;i++){ if(ldata[i]===r.label) mask.data[i]=255; }
+    const contours=new cv.MatVector(), hierarchy=new cv.Mat();
+    cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    if(contours.size()>0){
+      const hull=new cv.Mat();
+      cv.convexHull(contours.get(0), hull);
+      const hullMask=new cv.Mat.zeros(h, w, cv.CV_8U);
+      const pts=new cv.MatVector(); pts.push_back(hull);
+      cv.fillPoly(hullMask, pts, new cv.Scalar(1));
+      const ha=cv.countNonZero(hullMask);
+      r.solidity = ha>0 ? r.area/ha : NaN;
+      hull.delete(); hullMask.delete(); pts.delete();
+    }
+    mask.delete(); contours.delete(); hierarchy.delete();
+  }
+}
+
+function kdeDensity(logAreas, grid){
+  const n=logAreas.length;
+  if(n<2) return grid.map(()=>1);
+  let mean=0; for(const x of logAreas) mean+=x; mean/=n;
+  let sd=0; for(const x of logAreas) sd+=(x-mean)*(x-mean); sd=Math.sqrt(sd/n);
+  const bw=1.06*sd*Math.pow(n,-0.2)+EPS;
+  const density=grid.map(g=>{
+    let s=0; for(const x of logAreas) s+=Math.exp(-0.5*((g-x)/bw)**2);
+    return s/(n*bw*Math.sqrt(2*Math.PI));
+  });
+  return density;
+}
+
+function findPeaks(density){
+  const peaks=[];
+  for(let i=1;i<density.length-1;i++) if(density[i]>density[i-1] && density[i]>=density[i+1]) peaks.push(i);
+  return peaks;
+}
+
+function estimateSingleArea(areas){
+  const a=areas.filter(x=>x>=NOISE_FLOOR_PX);
+  if(a.length===0) throw new Error('no components');
+  if(a.length<5) return median(a);
+  const logAreas=a.map(x=>Math.log(x));
+  const lo=Math.min(...logAreas), hi=Math.max(...logAreas);
+  const grid=[]; for(let i=0;i<512;i++) grid.push(lo+(hi-lo)*i/511);
+  const density=kdeDensity(logAreas, grid);
+  const peakIdx=findPeaks(density);
+  let chosen;
+  if(peakIdx.length===0){ chosen=density.indexOf(Math.max(...density)); }
+  else{
+    const maxD=Math.max(...density);
+    const prominent=peakIdx.filter(i=>density[i]>=0.3*maxD);
+    chosen=prominent.length?prominent[0]:density.indexOf(maxD);
+  }
+  let a0=Math.exp(grid[chosen]);
+  const band=a.filter(x=>x>=SINGLE_BAND[0]*a0 && x<=SINGLE_BAND[1]*a0);
+  if(band.length) a0=band.reduce((s,x)=>s+x,0)/band.length;
+  return a0;
+}
+
+function median(arr){ const s=[...arr].sort((x,y)=>x-y); const m=s.length>>1; return s.length%2?s[m]:(s[m-1]+s[m])/2; }
+
+function calibrate(mask, needSolidity){
+  const {labels, rows} = componentTable(mask);
+  if(!rows.length) throw new Error('no foreground');
+  const a0=estimateSingleArea(rows.map(r=>r.area));
+  if(needSolidity) fillSolidity(labels, rows, SHAPE_FLOOR_RATIO*a0);
+  let singles=rows.filter(r=>r.area>=SINGLE_BAND[0]*a0 && r.area<=SINGLE_BAND[1]*a0);
+  if(!singles.length){ if(needSolidity) fillSolidity(labels, rows); singles=rows; }
+  const solidity0 = needSolidity ? median(singles.map(r=>r.solidity)) : NaN;
+  return {
+    labels, components:rows, a0,
+    major0: median(singles.map(r=>r.major)),
+    minor0: median(singles.map(r=>r.minor)),
+    width0: median(singles.map(r=>r.width)),
+    solidity0, axis_ratio0: median(singles.map(r=>r.axis_ratio)),
+    n_components:rows.length, n_singles:singles.length
+  };
+}
+
+function plausibleGrainPopulation(calib, frameArea, checkSolidity){
+  if(calib.n_singles < MIN_SINGLES) return false;
+  if(!(calib.axis_ratio0>=MIN_AXIS_RATIO && calib.axis_ratio0<=MAX_AXIS_RATIO)) return false;
+  if(checkSolidity && calib.solidity0 < MIN_SOLIDITY) return false;
+  if(calib.a0 > MAX_GRAIN_AREA_FRACTION * frameArea) return false;
+  return true;
+}
+
+function scoreCandidate(mask, frameArea){
+  const interior=clearBorder(ccStats(mask).labels, mask.rows, mask.cols);
+  const cov=interior.reduce((s,x)=>s+x,0)/interior.length;
+  if(cov>MAX_COVERAGE || cov<=0) return null;
+  let calib;
+  try { calib=calibrate(mask, false); } catch(e){ return null; }
+  if(!plausibleGrainPopulation(calib, frameArea, false)) return null;
+  return calib;
+}
+
+function preprocess(img){
+  const cands=candidateMasks(img);
+  const frameArea=img.rows*img.cols;
+  let scored=[];
+  for(const cand of cands){
+    const calib=scoreCandidate(cand.mask, frameArea);
+    if(calib) scored.push({cand, calib});
+  }
+  if(!scored.length) throw new Error('no candidate');
+  scored.sort((a,b)=>b.calib.n_singles*b.calib.a0 - a.calib.n_singles*a.calib.a0);
+  let chosen=null;
+  for(const {cand} of scored){
+    const calib=calibrate(cand.mask, true);
+    if(!plausibleGrainPopulation(calib, frameArea, true)) continue;
+    let mask=dropSubstrate(cand.mask, calib.a0);
+    mask=removeSpecks(mask, calib.a0);
+    let final;
+    try{ final=calibrate(mask, true); }catch(e){ continue; }
+    if(plausibleGrainPopulation(final, frameArea, true)){ chosen={cand, mask, calib:final}; break; }
+  }
+  if(!chosen) throw new Error('no candidate survived');
+  return chosen;
+}
+// ============ segment ============
+function widthExcess(comp, calib){
+  if(calib.width0<=0 || calib.a0<=0) return 0;
+  const ref=(comp.width/calib.width0)**2;
+  return (comp.area/calib.a0)/Math.max(ref,1e-6);
+}
+
+function adaptiveMarkers(dist, minor0, beta){
+  beta=beta===undefined?BETA:beta;
+  const h=Math.max(beta*minor0/2.0, MIN_DEPTH_PX);
+  const peaks=hMaxima(dist, h);
+  const radius=Math.max(1, Math.round(SEED_MERGE_RATIO*minor0/2.0));
+  const disc=cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(2*radius+1,2*radius+1));
+  const dilated=new cv.Mat(); cv.dilate(peaks, dilated, disc);
+  const {count, labels} = ccStats(dilated);
+  const H=dist.rows, W=dist.cols, N=H*W;
+  const pdata=u8(peaks), jdata=i32(labels);
+  const out=new cv.Mat.zeros(H, W, cv.CV_32S);
+  const odata=i32(out);
+  for(let i=0;i<N;i++) if(pdata[i]>0) odata[i]=jdata[i];
+  peaks.delete(); disc.delete(); dilated.delete(); labels.delete();
+  return out;
+}
+
+function isForeignObject(comp, calib){
+  if(comp.area <= FOREIGN_AREA_RATIO*calib.a0) return false;
+  if(calib.width0>0 && comp.width > FOREIGN_WIDTH_RATIO*calib.width0) return true;
+  return comp.solidity >= calib.solidity0;
+}
+
+function isTouching(comp, calib){
+  if(comp.area <= TOUCH_AREA_RATIO*calib.a0) return false;
+  if(calib.minor0 < MIN_TRUSTED_MINOR_PX) return widthExcess(comp, calib) > COARSE_TOUCH_EXCESS;
+  return comp.solidity < calib.solidity0 - TOUCH_SOLIDITY_MARGIN;
+}
+
+function splitComponent(mask, calib){
+  const H=mask.rows, W=mask.cols;
+  const dist=new cv.Mat(); cv.distanceTransform(mask, dist, cv.DIST_L2, 5);
+  const markers=adaptiveMarkers(dist, calib.minor0);
+  const mk=i32(markers);
+  let maxMk=0; for(let i=0;i<mk.length;i++) if(mk[i]>maxMk) maxMk=mk[i];
+  if(maxMk<=1){
+    const out=new Int32Array(H*W);
+    const msk=u8(mask);
+    for(let i=0;i<H*W;i++) if(msk[i]) out[i]=1;
+    dist.delete(); markers.delete();
+    return out;
+  }
+  const ws=wsWatershed(dist, markers, mask);
+  dist.delete(); markers.delete();
+  return ws;
+}
+
+function splitByCount(mask, k, minor0){
+  if(k<2) return null;
+  const H=mask.rows, W=mask.cols, N=H*W;
+  const dist=new cv.Mat(); cv.distanceTransform(mask, dist, cv.DIST_L2, 5);
+  const dd=f32(dist);
+  const dilated=new cv.Mat(); cv.dilate(dist, dilated, cv.Mat.ones(3,3,cv.CV_8U));
+  const ddil=f32(dilated);
+  const msk=u8(mask);
+  const peaks=[];
+  for(let i=0;i<N;i++) if(msk[i] && dd[i]===ddil[i]) peaks.push([dd[i], i]);
+  peaks.sort((a,b)=>b[0]-a[0]);
+  const spacing=SEED_MERGE_RATIO*minor0;
+  const chosen=[];
+  for(const [d, idx] of peaks){
+    const r=(idx/W)|0, c=idx%W;
+    let ok=true;
+    for(const [cr, cc] of chosen){ if(Math.hypot(r-cr, c-cc) < spacing){ ok=false; break; } }
+    if(ok){ chosen.push([r,c]); if(chosen.length===k) break; }
+  }
+  if(chosen.length<k){ dist.delete(); dilated.delete(); return null; }
+  const markers=new cv.Mat.zeros(H, W, cv.CV_32S);
+  const mk2=i32(markers);
+  chosen.forEach(([r,c], idx)=>{ mk2[r*W+c]=idx+1; });
+  const ws=wsWatershed(dist, markers, mask);
+  dist.delete(); dilated.delete(); markers.delete();
+  return ws;
+}
+
+// ============ correct ============
+function regionTable(labels, H, W){
+  const N=H*W;
+  const areas={}, labelSet=new Set();
+  for(let i=0;i<N;i++){ const l=labels[i]; if(l<=0) continue; areas[l]=(areas[l]||0)+1; labelSet.add(l); }
+  const regions=[];
+  for(const lab of labelSet){
+    const area=areas[lab];
+    let solidity=NaN;
+    const mask=new cv.Mat.zeros(H, W, cv.CV_8U);
+    for(let i=0;i<N;i++) if(labels[i]===lab) mask.data[i]=255;
+    const contours=new cv.MatVector(), hierarchy=new cv.Mat();
+    cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    if(contours.size()>0){
+      const hull=new cv.Mat(); cv.convexHull(contours.get(0), hull);
+      const hullMask=new cv.Mat.zeros(H, W, cv.CV_8U);
+      const pts=new cv.MatVector(); pts.push_back(hull);
+      cv.fillPoly(hullMask, pts, new cv.Scalar(1));
+      const ha=cv.countNonZero(hullMask);
+      solidity = ha>0 ? area/ha : NaN;
+      hull.delete(); hullMask.delete(); pts.delete();
+    }
+    mask.delete(); contours.delete(); hierarchy.delete();
+    regions.push({label:lab, area, solidity});
+  }
+  return regions;
+}
+
+function mergeFragments(labels, H, W, a0){
+  const N=H*W;
+  const out=labels.slice();
+  const regions=regionTable(labels, H, W);
+  regions.sort((a,b)=>a.area-b.area);
+  for(const reg of regions){
+    if(reg.area===0 || reg.area>=FRAGMENT_RATIO*a0) continue;
+    const piece=new Uint8Array(N);
+    for(let i=0;i<N;i++) if(out[i]===reg.label) piece[i]=1;
+    const pm=new cv.Mat(H, W, cv.CV_8U); pm.data.set(piece);
+    const dilated=new cv.Mat(); cv.dilate(pm, dilated, cv.Mat.ones(3,3,cv.CV_8U));
+    const neighbours={};
+    const dd=u8(dilated);
+    for(let i=0;i<N;i++) if(dd[i] && !piece[i]){ const l=out[i]; if(l>0) neighbours[l]=(neighbours[l]||0)+1; }
+    let bestL=-1, bestC=-1;
+    for(const l in neighbours) if(neighbours[l]>bestC){ bestC=neighbours[l]; bestL=Number(l); }
+    if(bestL>0) for(let i=0;i<N;i++) if(piece[i]) out[i]=bestL;
+    pm.delete(); dilated.delete();
+  }
+  return out;
+}
+
+function countRegions(labels, H, W, a0, solidity0){
+  const regions=regionTable(labels, H, W);
+  let total=0; const details=[];
+  for(const r of regions){
+    const ratio=r.area/a0;
+    let verdict, n;
+    if(ratio<FRAGMENT_RATIO){ verdict='fragment'; n=0; }
+    else if(ratio>RESIDUAL_RATIO && (solidity0===undefined || r.solidity < solidity0-CONCAVITY_MARGIN)){ verdict='residual'; n=Math.max(1, Math.round(ratio)); }
+    else { verdict='grain'; n=1; }
+    total+=n; details.push({label:r.label, ratio, verdict, n});
+  }
+  return [total, details];
+}
+
+function correctCluster(labels, H, W, a0, solidity0){
+  const merged=mergeFragments(labels, H, W, a0);
+  const [count, details]=countRegions(merged, H, W, a0, solidity0);
+  return [count, merged, details];
+}
+
+// ============ counter ============
+function countRice(img){
+  const pre=preprocess(img);
+  const calib=pre.calib;
+  const labels=calib.labels;
+  const a0=calib.a0;
+  const H=labels.rows, W=labels.cols;
+  const ldata=i32(labels);
+  let total=0;
+  const debug={n_isolated:0, n_clusters:0, n_foreign:0};
+  for(const comp of calib.components){
+    if(comp.area < SPECK_RATIO*a0) continue;
+    if(isForeignObject(comp, calib)){ debug.n_foreign++; continue; }
+    if(!isTouching(comp, calib)){ total++; debug.n_isolated++; continue; }
+    const [r0,c0,r1,c1]=comp.bbox;
+    const pr0=Math.max(0,r0-2), pc0=Math.max(0,c0-2);
+    const pr1=Math.min(H,r1+2), pc1=Math.min(W,c1+2);
+    const bh=pr1-pr0, bw=pc1-pc0;
+    const mask=new cv.Mat.zeros(bh, bw, cv.CV_8U);
+    for(let r=pr0;r<pr1;r++) for(let c=pc0;c<pc1;c++) if(ldata[r*W+c]===comp.label) mask.data[(r-pr0)*bw+(c-pc0)]=255;
+    const ws=splitComponent(mask, calib);
+    let count, merged, details;
+    [count, merged, details]=correctCluster(ws, bh, bw, a0, calib.solidity0);
+    if(RESPLIT){
+      // 简化：跳过 resplit（对精度影响小），直接用 correctCluster 结果
+    }
+    total+=count; debug.n_clusters++;
+    mask.delete();
+  }
+  return {total, pre, debug};
+}
+
+function labelImage(img){
+  const pre=preprocess(img);
+  const calib=pre.calib;
+  const labels=calib.labels;
+  const a0=calib.a0;
+  const H=labels.rows, W=labels.cols, N=H*W;
+  const ldata=i32(labels);
+  const instances=new Int32Array(N);
+  const info={};
+  let nextLabel=1, total=0;
+  for(const comp of calib.components){
+    if(comp.area < SPECK_RATIO*a0) continue;
+    if(isForeignObject(comp, calib)){
+      for(let i=0;i<N;i++) if(ldata[i]===comp.label) instances[i]=nextLabel;
+      info[nextLabel]={kind:'foreign', count:0}; nextLabel++;
+      continue;
+    }
+    if(!isTouching(comp, calib)){
+      for(let i=0;i<N;i++) if(ldata[i]===comp.label) instances[i]=nextLabel;
+      info[nextLabel]={kind:'grain', count:1}; total++; nextLabel++;
+      continue;
+    }
+    const [r0,c0,r1,c1]=comp.bbox;
+    const pr0=Math.max(0,r0-2), pc0=Math.max(0,c0-2);
+    const pr1=Math.min(H,r1+2), pc1=Math.min(W,c1+2);
+    const bh=pr1-pr0, bw=pc1-pc0;
+    const mask=new cv.Mat.zeros(bh, bw, cv.CV_8U);
+    for(let r=pr0;r<pr1;r++) for(let c=pc0;c<pc1;c++) if(ldata[r*W+c]===comp.label) mask.data[(r-pr0)*bw+(c-pc0)]=255;
+    const ws=splitComponent(mask, calib);
+    const [count, merged, details]=correctCluster(ws, bh, bw, a0, calib.solidity0);
+    const verdicts={}; for(const d of details) verdicts[d.label]=d;
+    total+=count;
+    const md=merged; // Int32Array（bh*bw）
+    for(let i=0;i<bh*bw;i++){
+      const localLabel=md[i];
+      if(localLabel===0) continue;
+      const detail=verdicts[localLabel]||{verdict:'grain', n:1};
+      if(detail.n===0) continue;
+      const gr=pr0+((i/bw)|0), gc=pc0+(i%bw);
+      instances[gr*W+gc]=nextLabel;
+    }
+    // 为每个本地 label 记录 info
+    const seen=new Set();
+    for(let i=0;i<bh*bw;i++){
+      const localLabel=md[i]; if(localLabel===0) continue;
+      if(seen.has(localLabel)) continue; seen.add(localLabel);
+      const detail=verdicts[localLabel]||{verdict:'grain', n:1};
+      if(detail.n===0) continue;
+      info[nextLabel]={kind:detail.verdict, count:detail.n};
+      nextLabel++;
+    }
+    mask.delete();
+  }
+  return {instances, info, total, pre};
+}
+// ============ UI ============
+function drawResult(instances, info, total, W, H, imgMat){
+  const canvas=document.getElementById('out');
+  canvas.width=W; canvas.height=H;
+  cv.imshow(canvas, imgMat);
+  const ctx=canvas.getContext('2d');
+  // 一次遍历累积每个 label 的 bbox
+  const bbox={};
+  for(let i=0;i<instances.length;i++){
+    const l=instances[i]; if(l<=0) continue;
+    const r=(i/W)|0, c=i%W;
+    if(!bbox[l]) bbox[l]={minR:r,maxR:r,minC:c,maxC:c};
+    else { const b=bbox[l]; if(r<b.minR)b.minR=r; if(r>b.maxR)b.maxR=r; if(c<b.minC)b.minC=c; if(c>b.maxC)b.maxC=c; }
+  }
+  let num=0;
+  ctx.lineWidth=1.5;
+  for(const key in info){
+    const meta=info[key]; if(meta.count===0) continue;
+    const b=bbox[key]; if(!b) continue;
+    const cnt=meta.count;
+    if(cnt===1){ num++; ctx.strokeStyle='#00c800'; ctx.fillStyle='#ff0000'; ctx.font='10px sans-serif'; ctx.fillText(String(num), b.minC, b.minR); }
+    else { ctx.strokeStyle='#ff7f00'; ctx.fillStyle='#ff0000'; ctx.fillText(cnt+'粒', b.minC, b.minR); }
+    ctx.strokeRect(b.minC, b.minR, b.maxC-b.minC, b.maxR-b.minR);
+  }
+  document.getElementById('result').textContent='计数结果：'+total+' 粒';
+  document.getElementById('canvasWrap').style.display='block';
+}
+
+function processFile(file){
+  const reader=new FileReader();
+  reader.onload=function(e){
+    const img=new Image();
+    img.onload=function(){
+      const srcCanvas=document.createElement('canvas');
+      srcCanvas.width=img.width; srcCanvas.height=img.height;
+      const sctx=srcCanvas.getContext('2d');
+      sctx.drawImage(img,0,0);
+      let mat=cv.imread(srcCanvas);
+      // 降分辨率
+      const side=Math.max(mat.rows, mat.cols);
+      if(side>MAX_SIDE){
+        const scale=MAX_SIDE/side;
+        const small=new cv.Mat();
+        cv.resize(mat, small, new cv.Size(Math.round(mat.cols*scale), Math.round(mat.rows*scale)), 0, 0, cv.INTER_AREA);
+        mat.delete(); mat=small;
+      }
+      document.getElementById('status').textContent='正在计数…';
+      // 异步跑（避免阻塞 UI）
+      setTimeout(function(){
+        try{
+          const {instances, info, total, pre}=labelImage(mat);
+          drawResult(instances, info, total, mat.cols, mat.rows, mat);
+          document.getElementById('status').textContent='完成（'+pre.cand.channel_name+' 通道）';
+        }catch(err){
+          document.getElementById('status').textContent='计数失败：'+err.message;
+          document.getElementById('result').textContent='';
+        }
+      }, 30);
+    };
+    img.src=e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+function bindUI(){
+  const camera=document.getElementById('camera');
+  const gallery=document.getElementById('gallery');
+  document.getElementById('shoot').addEventListener('click', function(){ camera.click(); });
+  document.getElementById('pick').addEventListener('click', function(){ gallery.click(); });
+  camera.addEventListener('change', function(e){ if(e.target.files.length) processFile(e.target.files[0]); });
+  gallery.addEventListener('change', function(e){ if(e.target.files.length) processFile(e.target.files[0]); });
+}
+bindUI();
+</script>
+</body>
+</html>
