@@ -64,3 +64,12 @@ gradle assembleDebug --no-daemon
 ## License
 
 MIT License（继承自原项目 stars-spark/asw-spc-rice-counting 的 MIT 协议）。
+
+
+## 版本 v1.3（2026-09-28）
+
+- **结果图点击放大**：点结果图或【🔍 放大查看结果图】按钮 → 全屏查看，双指缩放 / 单指拖动 / 双击放大还原，方便逐粒核对编号
+- **🔴 包名变更**：`com.example.ricecounter` → `com.example.graincounter`
+  （原包名与"穗粒数计数"App 冲突，两 App 会互相覆盖；改名后可共存。
+  升级注意：v1.3 会作为新 App 安装，旧版可手动卸载）
+- 下载：Releases → `grain-photo-counter-v1.3.0.apk`

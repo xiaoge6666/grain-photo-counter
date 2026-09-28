@@ -28,6 +28,8 @@ public class MainActivity extends Activity {
     private static final int TAKE_PHOTO = 2;
     private TextView resultText;
     private ImageView resultImage;
+    private Button zoomBtn;
+    private Bitmap resultBitmap;
     private Uri photoUri;
 
     @Override
@@ -81,7 +83,27 @@ public class MainActivity extends Activity {
         resultImage.setLayoutParams(new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
+        resultImage.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { showZoom(); }
+        });
         layout.addView(resultImage);
+
+        zoomBtn = new Button(this);
+        zoomBtn.setText("🔍 放大查看结果图（双指缩放/拖动/双击）");
+        zoomBtn.setTextSize(16);
+        zoomBtn.setEnabled(false);
+        zoomBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { showZoom(); }
+        });
+        layout.addView(zoomBtn);
+
+        TextView hint = new TextView(this);
+        hint.setTextSize(13);
+        hint.setText("👆 点结果图或上方按钮可全屏放大，逐粒核对编号");
+        hint.setPadding(0, 8, 0, 16);
+        layout.addView(hint);
 
         scroll.addView(layout);
         setContentView(scroll);
@@ -150,17 +172,50 @@ public class MainActivity extends Activity {
                         if (c < 0) {
                             resultText.setText("计数失败（错误码 " + c + "）");
                             resultImage.setImageBitmap(null);
+                            zoomBtn.setEnabled(false);
                         } else {
                             resultText.setText("计数结果: " + c + " 粒");
                             if (ab != null && ab.length > 0) {
-                                Bitmap bmp = BitmapFactory.decodeByteArray(ab, 0, ab.length);
-                                resultImage.setImageBitmap(bmp);
+                                resultBitmap = BitmapFactory.decodeByteArray(ab, 0, ab.length);
+                                resultImage.setImageBitmap(resultBitmap);
+                                zoomBtn.setEnabled(true);
                             }
                         }
                     }
                 });
             }
         }).start();
+    }
+
+    /** 全屏放大查看结果图 */
+    private void showZoom() {
+        if (resultBitmap == null || resultBitmap.isRecycled()) return;
+        try {
+            final android.app.Dialog d = new android.app.Dialog(this,
+                    android.R.style.Theme_Black_NoTitleBar_Fullscreen);
+            LinearLayout ll = new LinearLayout(this);
+            ll.setOrientation(LinearLayout.VERTICAL);
+            ZoomImageView zv = new ZoomImageView(this, resultBitmap);
+            ll.addView(zv, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+            TextView hint = new TextView(this);
+            hint.setTextSize(14);
+            hint.setTextColor(0xFFFFFFFF);
+            hint.setText("双指缩放 · 单指拖动 · 双击放大/还原");
+            hint.setPadding(24, 16, 24, 8);
+            ll.addView(hint);
+            Button close = new Button(this);
+            close.setText("关闭");
+            close.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) { d.dismiss(); }
+            });
+            ll.addView(close);
+            d.setContentView(ll);
+            d.show();
+        } catch (Throwable e) {
+            resultText.setText("放大失败: " + e.getMessage());
+        }
     }
 
     private byte[] readBytes(Uri uri) {
